@@ -1,0 +1,10 @@
+{
+  "resourceType": "Subscription",
+  "status": "active",
+  "criteria": "AuditEvent",
+  "channel": {
+    "type": "rest-hook",
+    "endpoint": "http://<JETSON-IP>:5001/fhir/notify",
+    "payload": "application/fhir+json"
+  }
+}

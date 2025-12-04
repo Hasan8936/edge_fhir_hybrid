@@ -1,0 +1,15 @@
+version: "3.8"
+services:
+  edge_node:
+    build: .
+    image: edge-fhir-hybrid:latest
+    # Use the nvidia runtime on Jetson devices to provide access to L4T
+    runtime: nvidia
+    # host networking is convenient for receiving REST hooks from the FHIR
+    # server without extra port mapping complexity. Consider more secure
+    # networking for production.
+    network_mode: host
+    restart: always
+    volumes:
+      - ./models:/opt/app/models:ro
+      - ./logs:/opt/app/logs
