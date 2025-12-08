@@ -44,6 +44,7 @@ logs/*
 # Models (these are trained offline and added post-hoc)
 models/*.pkl
 models/*.npy
+!models/README.md
 !models/.gitkeep
 
 # OS
