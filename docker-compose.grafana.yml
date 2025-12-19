@@ -1,0 +1,144 @@
+"""
+Docker Compose stack for Edge FHIR Hybrid with monitoring.
+
+Services:
+- app: Flask FHIR security service (edge inference)
+- loki: Log aggregation (stores alerts)
+- promtail: Log shipper (sends alerts to Loki)
+- grafana: Visualization and alerting
+
+Network: Isolated network (no external exposure by default)
+
+Security:
+- Grafana runs on localhost:3000 (map to public only if needed)
+- Loki on 3100 (internal only)
+- FHIR API on 5001 (configurable)
+
+Deployment on Jetson Nano:
+docker-compose -f docker-compose.grafana.yml up -d
+"""
+
+version: '3.8'
+
+services:
+  # ===== FHIR Security Service =====
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BASE_IMAGE: nvcr.io/nvidia/l4t-ml:r32.6.1-py3
+    container_name: edge-fhir-hybrid
+    
+    # ⚠️ IMPORTANT: Use nvidia runtime for GPU support on Jetson
+    runtime: nvidia
+    
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - CUDA_VISIBLE_DEVICES=0
+      - PYTHONUNBUFFERED=1
+    
+    ports:
+      - "5001:5001"  # Flask API
+    
+    volumes:
+      - ./models:/workspace/models:ro  # Read-only models
+      - ./logs:/workspace/logs:rw      # Alerts log
+      - ./config:/workspace/config:ro  # Configs
+    
+    networks:
+      - monitoring
+    
+    depends_on:
+      - loki
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ===== LOKI: Log Storage =====
+  loki:
+    image: grafana/loki:latest
+    container_name: loki
+    
+    ports:
+      - "3100:3100"  # Internal only
+    
+    volumes:
+      - loki-data:/loki
+    
+    command: -config.file=/etc/loki/local-config.yaml
+    
+    networks:
+      - monitoring
+    
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3100/loki/api/v1/status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ===== PROMTAIL: Log Shipper =====
+  promtail:
+    image: grafana/promtail:latest
+    container_name: promtail
+    
+    volumes:
+      - ./config/promtail.yaml:/etc/promtail/config.yaml:ro
+      - ./logs:/logs:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    
+    command: -config.file=/etc/promtail/config.yaml
+    
+    networks:
+      - monitoring
+    
+    depends_on:
+      - loki
+
+  # ===== GRAFANA: Visualization & Alerting =====
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    
+    ports:
+      - "3000:3000"  # Web UI
+    
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_INSTALL_PLUGINS=grafana-piechart-panel
+      - GF_PATHS_PROVISIONING=/etc/grafana/provisioning
+      - GF_LOG_MODE=console
+    
+    volumes:
+      - grafana-storage:/var/lib/grafana
+      - ./config/grafana:/etc/grafana/provisioning:ro
+    
+    networks:
+      - monitoring
+    
+    depends_on:
+      - loki
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+networks:
+  monitoring:
+    driver: bridge
+
+volumes:
+  loki-data:
+  grafana-storage:
