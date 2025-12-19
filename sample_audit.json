@@ -1,0 +1,18 @@
+{
+  "resourceType": "AuditEvent",
+  "event": {
+    "type": { "code": "110112" },
+    "action": "E",
+    "outcome": "0"
+  },
+  "action": "E",
+  "outcome": "0",
+  "agent": [
+    {
+      "userId": "doctor_42",
+      "network": {
+        "address": "192.168.1.10"
+      }
+    }
+  ]
+}

@@ -1,145 +1,42 @@
-"""Model loader and inference helper for the deployed hybrid model.
-
-This module is responsible for loading pre-trained artifacts from disk and
-exposing a small API for inference. It is intentionally lightweight and does
-not attempt any training.
-"""
-from __future__ import annotations
-
-import logging
-import os
-from pathlib import Path
-from typing import Any, Optional, Tuple
+# app/edge_model.py
 
 import joblib
 import numpy as np
 import pickle
+import os
 
-from .config import MODELS_DIR
+from app.trt.trt_runtime import TensorRTXGB
 
-logger = logging.getLogger(__name__)
-
-
-class ModelLoadError(RuntimeError):
-    """Raised when a required model artifact cannot be loaded."""
-
+MODELS_DIR = "models"
 
 class HybridDeployedModel:
-    """Load and serve a hybrid ensemble of RandomForest and XGBoost.
+    def __init__(self):
+        self.rf = joblib.load(os.path.join(MODELS_DIR, "rf_model.pkl"))
+        self.scaler = joblib.load(os.path.join(MODELS_DIR, "scaler.pkl"))
+        self.mask = np.load(os.path.join(MODELS_DIR, "feature_mask.npy"))
 
-    Parameters
-    ----------
-    rf_weight: float
-        Weight for the RandomForest predictions (XGBoost gets 1 - rf_weight).
-    models_dir: Optional[str]
-        Directory where model artifacts live. Defaults to `MODELS_DIR`.
-    """
+        with open(os.path.join(MODELS_DIR, "label_encoder.pkl"), "rb") as f:
+            self.le = pickle.load(f)
 
-    def __init__(self, rf_weight: float = 0.5, models_dir: Optional[str] = None) -> None:
-        self.rf_weight = float(rf_weight)
-        self.xgb_weight = 1.0 - self.rf_weight
-        self.models_dir = Path(models_dir or MODELS_DIR)
-        self.rf: Any = None
-        self.xgb: Any = None
-        self.scaler: Any = None
-        self.mask: Optional[np.ndarray] = None
-        self.le: Any = None
-        self._load_artifacts()
+        # TensorRT XGBoost
+        self.trt_xgb = TensorRTXGB(
+            os.path.join(MODELS_DIR, "xgb_model.engine")
+        )
 
-    def _load_artifacts(self) -> None:
-        """Load model artifacts from disk and validate their presence.
+        # ensemble weights
+        self.RW = 0.5
+        self.XW = 0.5
 
-        Raises
-        ------
-        ModelLoadError
-            If any required file is missing or cannot be loaded.
-        """
-        try:
-            rf_path = self.models_dir / "rf_model.pkl"
-            xgb_path = self.models_dir / "xgb_model.pkl"
-            scaler_path = self.models_dir / "scaler.pkl"
-            mask_path = self.models_dir / "feature_mask.npy"
-            le_path = self.models_dir / "label_encoder.pkl"
-
-            for p in (rf_path, xgb_path, scaler_path, mask_path, le_path):
-                if not p.exists():
-                    raise ModelLoadError(f"Missing model artifact: {p}")
-
-            logger.info("Loading RandomForest model from %s", rf_path)
-            self.rf = joblib.load(str(rf_path))
-
-            logger.info("Loading XGBoost model from %s", xgb_path)
-            self.xgb = joblib.load(str(xgb_path))
-
-            logger.info("Loading scaler from %s", scaler_path)
-            self.scaler = joblib.load(str(scaler_path))
-
-            logger.info("Loading feature mask from %s", mask_path)
-            self.mask = np.load(str(mask_path)).astype(bool)
-
-            logger.info("Loading label encoder from %s", le_path)
-            with open(str(le_path), "rb") as f:
-                self.le = pickle.load(f)
-        except Exception as exc:  # keep broad to wrap unknown errors
-            logger.exception("Failed loading model artifacts: %s", exc)
-            raise ModelLoadError(str(exc)) from exc
-
-    def preprocess(self, X: np.ndarray) -> np.ndarray:
-        """Scale and apply the feature mask to an input array.
-
-        Parameters
-        ----------
-        X: np.ndarray
-            2D array of raw features with shape (n_samples, n_raw_features).
-
-        Returns
-        -------
-        np.ndarray
-            Transformed feature array suitable for prediction.
-        """
-        if self.scaler is None or self.mask is None:
-            raise ModelLoadError("Model scaler or mask not loaded")
+    def predict_proba(self, X):
+        # scale + select features
         Xs = self.scaler.transform(X)
-        # mask must index the second dimension
-        try:
-            return Xs[:, self.mask]
-        except Exception as exc:
-            logger.exception("Feature mask application failed: %s", exc)
-            raise
+        Xs = Xs[:, self.mask]
 
-    def predict_proba(self, X: np.ndarray) -> np.ndarray:
-        """Return ensemble predicted probabilities for input X.
-
-        Parameters
-        ----------
-        X: np.ndarray
-            2D array (n_samples, n_raw_features)
-
-        Returns
-        -------
-        np.ndarray
-            Array of shape (n_samples, n_classes) with probabilities.
-        """
-        Xs = self.preprocess(X)
+        # RF (CPU)
         pr = self.rf.predict_proba(Xs)
-        px = self.xgb.predict_proba(Xs)
-        # ensure shapes match
-        if pr.shape != px.shape:
-            raise RuntimeError("RF and XGB predict_proba returned different shapes")
-        return self.rf_weight * pr + self.xgb_weight * px
 
-    def predict(self, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Return predicted labels and probability vectors.
+        # XGB (TensorRT GPU)
+        px = self.trt_xgb.predict_proba(Xs).reshape(1, -1)
 
-        Returns
-        -------
-        labels: np.ndarray
-            Decoded labels (strings) for each sample.
-        probs: np.ndarray
-            Probability vectors for each sample.
-        """
-        probs = self.predict_proba(X)
-        idx = probs.argmax(axis=1)
-        labels = self.le.inverse_transform(idx)
-        return labels, probs
-
+        probs = self.RW * pr + self.XW * px
+        return probs, self.le.classes_
