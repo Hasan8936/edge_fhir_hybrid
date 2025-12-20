@@ -1,173 +1,157 @@
-"""
-Hybrid classification model combining RandomForest and XGBoost.
-
-PRODUCTION-GRADE EDGE ARCHITECTURE:
-- RandomForest (RF): CPU-based, low latency, reliable
-- XGBoost (XGB): CPU-based, high accuracy
-- CNN Autoencoder: TensorRT-accelerated (separate module in app/cnn/)
-
-RF+XGB OUTPUT: Classification (Normal, DDoS, etc.)
-CNN AE OUTPUT: Reconstruction error (anomaly likelihood)
-
-This module handles ONLY the tree ensemble classification.
-CNN inference is managed separately in app/cnn/trt_runtime.py
-to avoid complex TensorRT conversions of tree models.
-
-Security note: Never attempt to convert tree models to TensorRT.
-They are best deployed on CPU using native inference engines.
-"""
-
-import joblib
 import numpy as np
+import joblib
 import pickle
 import os
-import logging
-
-logger = logging.getLogger(__name__)
-
-MODELS_DIR = "models"
-
+from app.ae_runtime import AERuntime
 
 class HybridDeployedModel:
     """
-    CPU-based RandomForest + XGBoost ensemble.
-    
-    Features:
-    - Loads pre-trained models from .pkl files
-    - Applies feature scaling
-    - Selects GOA-identified features via mask
-    - Ensemble prediction via weighted average
-    - No GPU/TensorRT involved (trees don't benefit)
-    
-    Attributes:
-        rf: Trained RandomForest classifier
-        xgb: Trained XGBoost classifier
-        scaler: Feature StandardScaler
-        mask: Boolean array selecting important features
-        le: Label encoder (maps class indices to names)
-        rf_weight: Weight for RF in ensemble [0, 1]
-        xgb_weight: Weight for XGB in ensemble [0, 1]
+    Complete hybrid detection system:
+    - RF + XGB for attack classification
+    - AutoEncoder for anomaly scoring
     """
     
-    def __init__(self):
+    def __init__(self, models_dir="models"):
         """
-        Initialize hybrid model from saved artifacts.
-        
-        Raises:
-            FileNotFoundError: If any required model file missing
-            ValueError: If models cannot be loaded
+        Load all trained models and preprocessors
         """
-        logger.info("Initializing HybridDeployedModel...")
+        print("[Hybrid Model] Loading artifacts...")
         
-        # Load components
-        try:
-            self.rf = joblib.load(os.path.join(MODELS_DIR, "rf_model.pkl"))
-            logger.info("✓ RandomForest model loaded")
-        except FileNotFoundError:
-            raise FileNotFoundError(
-                f"RandomForest model not found: {MODELS_DIR}/rf_model.pkl"
-            )
+        # Load preprocessors
+        self.scaler = joblib.load(os.path.join(models_dir, "scaler.pkl"))
+        self.feature_mask = np.load(os.path.join(models_dir, "feature_mask.npy"))
         
-        try:
-            self.xgb = joblib.load(os.path.join(MODELS_DIR, "xgb_model.pkl"))
-            logger.info("✓ XGBoost model loaded")
-        except FileNotFoundError:
-            raise FileNotFoundError(
-                f"XGBoost model not found: {MODELS_DIR}/xgb_model.pkl"
-            )
+        # Load label encoder
+        with open(os.path.join(models_dir, "label_encoder.pkl"), "rb") as f:
+            self.label_encoder = pickle.load(f)
         
-        try:
-            self.scaler = joblib.load(os.path.join(MODELS_DIR, "scaler.pkl"))
-            logger.info("✓ Feature scaler loaded")
-        except FileNotFoundError:
-            raise FileNotFoundError(
-                f"Scaler not found: {MODELS_DIR}/scaler.pkl"
-            )
+        # Load RF and XGB models
+        self.rf_model = joblib.load(os.path.join(models_dir, "rf_model.pkl"))
+        self.xgb_model = joblib.load(os.path.join(models_dir, "xgb_model.pkl"))
         
-        try:
-            self.mask = np.load(os.path.join(MODELS_DIR, "feature_mask.npy"))
-            logger.info(f"✓ Feature mask loaded ({np.sum(self.mask)} features selected)")
-        except FileNotFoundError:
-            raise FileNotFoundError(
-                f"Feature mask not found: {MODELS_DIR}/feature_mask.npy"
-            )
+        # Load AutoEncoder
+        self.ae = AERuntime(os.path.join(models_dir, "ae.pth"))
         
-        try:
-            with open(os.path.join(MODELS_DIR, "label_encoder.pkl"), "rb") as f:
-                self.le = pickle.load(f)
-            logger.info(f"✓ Label encoder loaded: {list(self.le.classes_)}")
-        except FileNotFoundError:
-            raise FileNotFoundError(
-                f"Label encoder not found: {MODELS_DIR}/label_encoder.pkl"
-            )
-        
-        # Ensemble weights
-        # Tuned for this specific dataset (can be optimized via validation)
-        self.rf_weight = 0.5
-        self.xgb_weight = 0.5
-        
-        logger.info(f"HybridDeployedModel initialized successfully")
-        logger.info(f"  Ensemble weights: RF={self.rf_weight}, XGB={self.xgb_weight}")
+        print(f"[Hybrid Model] ✓ Loaded {len(self.feature_mask)} selected features")
+        print(f"[Hybrid Model] ✓ Classes: {list(self.label_encoder.classes_)}")
     
-    def predict_proba(self, X: np.ndarray) -> tuple:
+    def preprocess(self, X):
         """
-        Predict class probabilities using weighted ensemble.
+        Apply scaling and feature selection
         
         Args:
-            X: Input features of shape (n_samples, n_features_all)
-               Will be scaled and feature-selected
+            X: Raw features (n_samples, all_features)
         
         Returns:
-            (probabilities, class_names) where:
-            - probabilities: (n_samples, n_classes) probability matrix
-            - class_names: List of class names
+            Processed features (n_samples, selected_features)
         """
-        # Feature preprocessing
+        # Scale
         X_scaled = self.scaler.transform(X)
-        X_selected = X_scaled[:, self.mask]
         
-        # RF prediction
-        rf_probs = self.rf.predict_proba(X_selected)
+        # Select features
+        X_selected = X_scaled[:, self.feature_mask]
         
-        # XGB prediction
-        xgb_probs = self.xgb.predict_proba(X_selected)
+        return X_selected
+    
+    def predict(self, X):
+        """
+        Predict attack class and compute anomaly score
         
-        # Ensemble: weighted average
-        ensemble_probs = (
-            self.rf_weight * rf_probs + 
-            self.xgb_weight * xgb_probs
+        Args:
+            X: Raw features (n_samples, all_features)
+        
+        Returns:
+            tuple: (predicted_class, anomaly_score, attack_probabilities)
+        """
+        # Preprocess
+        X_processed = self.preprocess(X)
+        
+        # Get predictions from RF and XGB
+        rf_probs = self.rf_model.predict_proba(X_processed)
+        xgb_probs = self.xgb_model.predict_proba(X_processed)
+        
+        # Ensemble (50-50 blend)
+        ensemble_probs = 0.5 * rf_probs + 0.5 * xgb_probs
+        
+        # Get predicted class
+        predicted_class_idx = np.argmax(ensemble_probs, axis=1)
+        predicted_class = self.label_encoder.inverse_transform(predicted_class_idx)
+        
+        # Get anomaly score from AutoEncoder
+        ae_score = self.ae.score(X_processed)
+        
+        # Return results
+        return (
+            predicted_class[0],
+            float(ae_score),
+            ensemble_probs[0].tolist()
+        )
+    
+    def predict_batch(self, X):
+        """
+        Predict for multiple samples
+        
+        Args:
+            X: Raw features (n_samples, all_features)
+        
+        Returns:
+            dict: Batch prediction results
+        """
+        # Preprocess
+        X_processed = self.preprocess(X)
+        
+        # Get predictions
+        rf_probs = self.rf_model.predict_proba(X_processed)
+        xgb_probs = self.xgb_model.predict_proba(X_processed)
+        ensemble_probs = 0.5 * rf_probs + 0.5 * xgb_probs
+        
+        # Classes
+        predicted_classes = self.label_encoder.inverse_transform(
+            np.argmax(ensemble_probs, axis=1)
         )
         
-        return ensemble_probs, self.le.classes_
+        # Anomaly scores
+        ae_scores = self.ae.score_batch(X_processed)
+        
+        return {
+            'classes': predicted_classes.tolist(),
+            'ae_scores': ae_scores.tolist(),
+            'probabilities': ensemble_probs.tolist()
+        }
     
-    def predict(self, X: np.ndarray) -> np.ndarray:
+    def analyze(self, X, meta=None, thresholds={'low': 0.01, 'medium': 0.05, 'high': 0.1}):
         """
-        Predict class labels (argmax of probabilities).
+        Complete analysis with severity assessment
         
         Args:
-            X: Input features of shape (n_samples, n_features_all)
+            X: Raw features (1, all_features)
+            meta: Optional metadata dict
+            thresholds: AE score thresholds
         
         Returns:
-            Predicted class labels
+            dict: Complete analysis results
         """
-        probs, _ = self.predict_proba(X)
-        return np.argmax(probs, axis=1)
-    
-    def predict_with_confidence(self, X: np.ndarray) -> tuple:
-        """
-        Predict classes with confidence scores.
+        pred_class, ae_score, probs = self.predict(X)
         
-        Args:
-            X: Input features
+        # Determine severity based on AE score
+        if ae_score >= thresholds['high']:
+            severity = "HIGH"
+        elif ae_score >= thresholds['medium']:
+            severity = "MEDIUM"
+        else:
+            severity = "LOW"
         
-        Returns:
-            (predicted_labels, confidences, class_names) where:
-            - predicted_labels: Class indices
-            - confidences: Max probability per sample
-            - class_names: List of all class names
-        """
-        probs, class_names = self.predict_proba(X)
-        predicted_indices = np.argmax(probs, axis=1)
-        confidences = np.max(probs, axis=1)
+        # Check if anomalous
+        is_anomalous = (pred_class != "Normal") or (severity != "LOW")
         
-        return predicted_indices, confidences, class_names
+        return {
+            'prediction': pred_class,
+            'ae_score': ae_score,
+            'severity': severity,
+            'is_anomalous': is_anomalous,
+            'probabilities': {
+                class_name: float(prob)
+                for class_name, prob in zip(self.label_encoder.classes_, probs)
+            },
+            'metadata': meta or {}
+        }
