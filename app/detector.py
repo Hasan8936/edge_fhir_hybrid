@@ -1,46 +1,28 @@
 import numpy as np
 
+
 class EdgeDetector:
-    def __init__(self, model, normal="Normal", hi=0.95, mid=0.85):
+    """Detector orchestrates the hybrid pipeline using AE-first logic.
+
+    If AE error < low threshold -> fast-exit as Normal. Otherwise runs RF+XGB.
+    """
+
+    def __init__(self, model, thresholds=None):
         self.model = model
-        self.normal = normal
-        self.hi = hi
-        self.mid = mid
-
-    def _score(self, probs, classes):
-        if self.normal in classes:
-            idx = list(classes).index(self.normal)
-            return 1.0 - float(probs[idx])
-        return 1.0 - float(np.max(probs))
-
-    def _severity(self, score):
-        if score >= self.hi:
-            return "HIGH"
-        if score >= self.mid:
-            return "MEDIUM"
-        return "LOW"
+        if thresholds is None:
+            thresholds = {"low": 0.01, "medium": 0.05, "high": 0.1}
+        self.thresholds = thresholds
 
     def analyze(self, X, meta=None):
-        probs, classes = self.model.predict_proba(X)
-        probs = probs[0]
-
-        pred = classes[np.argmax(probs)]
-        score = self._score(probs, classes)
-        sev = self._severity(score)
-        anom = (pred != self.normal) or (sev != "LOW")
-
+        # X expected shape (1, n_features) or list
+        result = self.model.infer(X[0] if isinstance(X, (list, tuple, np.ndarray)) and np.array(X).ndim == 2 else X, meta=meta, thresholds=self.thresholds)
         return {
-            "pred": str(pred),
-            "score": float(score),
-            "sev": sev,
-            "anom": bool(anom),
-            "meta": meta or {},
-            "all_results": {
-                "default": {
-                    "classes": list(classes),
-                    "probs": probs.tolist()
-                }
-            }
+            "pred": result.get("pred"),
+            "score": result.get("score"),
+            "sev": result.get("sev"),
+            "anom": result.get("anom"),
+            "meta": result.get("meta"),
+            "all_results": result.get("all_results")
         }
 
 

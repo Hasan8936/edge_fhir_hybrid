@@ -2,23 +2,48 @@ import tensorrt as trt
 
 TRT_LOGGER = trt.Logger(trt.Logger.INFO)
 
-def build_engine(onnx_path, engine_path):
-    with trt.Builder(TRT_LOGGER) as builder, \
-         builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)) as network, \
-         trt.OnnxParser(network, TRT_LOGGER) as parser:
 
-        builder.max_workspace_size = 1 << 28
-        builder.fp16_mode = True
+def build_engine(onnx_path, engine_path, workspace_size=(1 << 28), fp16=True):
+    """
+    Build a TensorRT engine from ONNX using the modern builder/config API.
+
+    Writes a serialized engine to `engine_path`.
+    """
+    with trt.Builder(TRT_LOGGER) as builder:
+        flags = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
+        network = builder.create_network(flags)
+        parser = trt.OnnxParser(network, TRT_LOGGER)
 
         with open(onnx_path, "rb") as f:
-            parser.parse(f.read())
+            if not parser.parse(f.read()):
+                raise RuntimeError("Failed to parse ONNX file")
 
-        engine = builder.build_cuda_engine(network)
+        config = builder.create_builder_config()
+        config.max_workspace_size = workspace_size
+        if fp16 and hasattr(trt, 'BuilderFlag'):
+            try:
+                config.set_flag(trt.BuilderFlag.FP16)
+            except Exception:
+                pass
 
-        with open(engine_path, "wb") as f:
-            f.write(engine.serialize())
+        # Build serialized network (preferred for newer TRT versions)
+        if hasattr(builder, 'build_serialized_network'):
+            serialized_engine = builder.build_serialized_network(network, config)
+            if serialized_engine is None:
+                raise RuntimeError("Failed to build serialized engine")
+            with open(engine_path, "wb") as f:
+                f.write(serialized_engine)
+        else:
+            # Fallback (older API)
+            engine = builder.build_cuda_engine(network)
+            if engine is None:
+                raise RuntimeError("Failed to build engine")
+            with open(engine_path, "wb") as f:
+                f.write(engine.serialize())
 
-        print("[OK] TensorRT engine built")
+        print("[OK] TensorRT engine built: {}".format(engine_path))
+
 
 if __name__ == "__main__":
-    build_engine("models/xgb_model.onnx", "models/xgb_model.engine")
+    # Example: build AE engine
+    build_engine("models/ae.onnx", "models/ae.engine")

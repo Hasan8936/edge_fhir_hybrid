@@ -2,20 +2,23 @@ from flask import Flask, request, jsonify
 from app.edge_model import HybridDeployedModel
 import numpy as np
 import os
+import datetime
 
 app = Flask(__name__)
 
 # Initialize model
-print("="*60)
+print("=" * 60)
 print("🚀 INITIALIZING HYBRID DETECTION SYSTEM")
-print("="*60)
+print("=" * 60)
 
 try:
     model = HybridDeployedModel(models_dir="models")
+    MODEL_READY = True
     print("✅ Model loaded successfully!\n")
 except Exception as e:
-    print(f"❌ Failed to load model: {e}")
-    raise
+    MODEL_READY = False
+    print("❌ Failed to load model: {}".format(e))
+    # Keep server running but /health will report not ready
 
 # ======================== API ENDPOINTS ========================
 
@@ -25,8 +28,9 @@ def health_check():
     Health check endpoint
     """
     return jsonify({
-        "status": "healthy",
+        "status": "healthy" if MODEL_READY else "degraded",
         "service": "FHIR Hybrid Detection System",
+        "model_ready": bool(MODEL_READY),
         "version": "1.0.0"
     }), 200
 
@@ -56,26 +60,36 @@ def fhir_notify():
             }), 400
         
         # Extract features
-        features = np.array(data["features"]).reshape(1, -1)
+        features = data["features"]
         metadata = data.get("metadata", {})
-        
-        # Run analysis
-        result = model.analyze(features, meta=metadata)
-        
-        # Format response
+
+        # Run hybrid inference
+        result = model.infer(features, meta=metadata)
+
+        # Persist alerts when anomalous
+        if result.get("anom"):
+            try:
+                os.makedirs("logs", exist_ok=True)
+                with open(os.path.join("logs", "alerts.log"), "a") as f:
+                    f.write("{time} - ALERT - pred={pred} score={score:.6f} meta={meta}\n".format(
+                        time=datetime.datetime.utcnow().isoformat(),
+                        pred=result.get("pred"),
+                        score=float(result.get("score", 0.0)),
+                        meta=str(result.get("meta", {}))
+                    ))
+            except Exception:
+                pass
+
+        # Response must match required format
         response = {
-            "prediction": result['prediction'],
-            "ae_score": result['ae_score'],
-            "severity": result['severity'],
-            "is_anomalous": result['is_anomalous'],
-            "probabilities": result['probabilities'],
-            "metadata": result['metadata']
+            "pred": result.get("pred"),
+            "score": float(result.get("score")),
+            "sev": result.get("sev"),
+            "anom": bool(result.get("anom")),
+            "meta": result.get("meta"),
+            "all_results": result.get("all_results")
         }
-        
-        # Log if anomalous
-        if result['is_anomalous']:
-            print(f"⚠️  ANOMALY DETECTED: {result['prediction']} (score: {result['ae_score']:.4f})")
-        
+
         return jsonify(response), 200
     
     except Exception as e:
@@ -109,28 +123,14 @@ def fhir_batch():
         samples = data["samples"]
         
         # Extract all features
-        features = np.array([s["features"] for s in samples])
-        
-        # Batch prediction
-        batch_results = model.predict_batch(features)
-        
-        # Format response
+        features = [s["features"] for s in samples]
+
         results = []
-        for i, sample in enumerate(samples):
-            results.append({
-                "prediction": batch_results['classes'][i],
-                "ae_score": batch_results['ae_scores'][i],
-                "probabilities": {
-                    class_name: batch_results['probabilities'][i][j]
-                    for j, class_name in enumerate(model.label_encoder.classes_)
-                },
-                "metadata": sample.get("metadata", {})
-            })
-        
-        return jsonify({
-            "count": len(results),
-            "results": results
-        }), 200
+        for sample in samples:
+            res = model.infer(sample.get("features"), meta=sample.get("metadata", {}))
+            results.append(res)
+
+        return jsonify({"count": len(results), "results": results}), 200
     
     except Exception as e:
         return jsonify({
@@ -147,8 +147,8 @@ def model_info():
         "model": "RF + XGB + CNN AutoEncoder",
         "classes": list(model.label_encoder.classes_),
         "n_features": len(model.feature_mask),
-        "rf_estimators": model.rf_model.n_estimators,
-        "xgb_estimators": model.xgb_model.n_estimators
+        "rf_estimators": getattr(model.rf_model, 'n_estimators', None),
+        "xgb_estimators": getattr(model.xgb_model, 'n_estimators', None)
     }), 200
 
 

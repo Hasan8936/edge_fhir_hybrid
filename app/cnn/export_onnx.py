@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 def export_to_onnx(
     model: torch.nn.Module,
     input_dim: int = 25,
-    onnx_path: str = "models/cnn_ae.onnx",
+    onnx_path: str = "models/ae.onnx",
     opset_version: int = 11,
 ) -> str:
     """
@@ -112,7 +112,7 @@ if __name__ == "__main__":
     
     # Path to trained model weights
     model_path = "models/cnn_ae.pth"
-    onnx_path = "models/cnn_ae.onnx"
+    onnx_path = "models/ae.onnx"
     
     if not os.path.exists(model_path):
         logger.error(f"Model weights not found: {model_path}")
