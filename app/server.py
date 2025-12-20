@@ -12,11 +12,12 @@ print("🚀 INITIALIZING HYBRID DETECTION SYSTEM")
 print("=" * 60)
 
 try:
-    model = HybridDeployedModel(models_dir="models")
+    model = HybridDeployedModel()
     MODEL_READY = True
     print("✅ Model loaded successfully!\n")
 except Exception as e:
     MODEL_READY = False
+    model = None
     print("❌ Failed to load model: {}".format(e))
     # Keep server running but /health will report not ready
 
@@ -143,12 +144,15 @@ def model_info():
     """
     Get model information
     """
+    if not MODEL_READY:
+        return jsonify({"error": "Model not loaded"}), 500
+    
     return jsonify({
         "model": "RF + XGB + CNN AutoEncoder",
         "classes": list(model.label_encoder.classes_),
         "n_features": len(model.feature_mask),
-        "rf_estimators": getattr(model.rf_model, 'n_estimators', None),
-        "xgb_estimators": getattr(model.xgb_model, 'n_estimators', None)
+        "rf_estimators": getattr(model.rf, 'n_estimators', None),
+        "xgb_estimators": getattr(model.xgb, 'n_estimators', None)
     }), 200
 
 
